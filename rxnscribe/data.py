@@ -1,9 +1,40 @@
 import os
 import cv2
+import time
 import numpy as np
 import matplotlib.colors as colors
 import matplotlib.patches as patches
 from PIL import Image
+from threading import local
+
+# Thread-local storage for timing data (to avoid conflicts in parallel execution)
+_rxnscribe_timing = local()
+
+def _get_rxnscribe_timing():
+    """Get or create thread-local timing storage."""
+    if not hasattr(_rxnscribe_timing, 'data'):
+        _rxnscribe_timing.data = {
+            'modules': [],
+            'total_time': None,
+        }
+    return _rxnscribe_timing.data
+
+def reset_rxnscribe_timing():
+    """Reset timing data for a new run."""
+    if hasattr(_rxnscribe_timing, 'data'):
+        _rxnscribe_timing.data = {
+            'modules': [],
+            'total_time': None,
+        }
+
+def get_rxnscribe_timing():
+    """Get current timing data."""
+    return _get_rxnscribe_timing().copy()
+
+def record_timing(name, elapsed):
+    """Record a timing measurement."""
+    timing = _get_rxnscribe_timing()
+    timing['modules'].append({'name': name, 'time': elapsed})
 
 
 class BBox(object):
@@ -447,29 +478,64 @@ def deduplicate_reactions(reactions):
 
 
 def postprocess_reactions(reactions, image_file=None, image=None, molscribe=None, ocr=None, batch_size=32):
+    reset_rxnscribe_timing()
+    total_start = time.time()
+
+    # Image data creation
+    t0 = time.time()
     image_data = ReactionImageData(predictions=reactions, image_file=image_file, image=image)
+    record_timing('postprocess_reactions.image_data_creation', time.time() - t0)
+
     pred_reactions = image_data.pred_reactions
+
+    # Deduplication
+    t0 = time.time()
     for r in pred_reactions:
         r.deduplicate()
     pred_reactions.deduplicate()
+    record_timing('postprocess_reactions.deduplication', time.time() - t0)
+
     if molscribe:
+        # Collect molecule bboxes
+        t0 = time.time()
         bbox_images, bbox_indices = [], []
         for i, reaction in enumerate(pred_reactions):
             for j, bbox in enumerate(reaction.bboxes):
                 if bbox.is_mol:
                     bbox_images.append(bbox.image())
                     bbox_indices.append((i, j))
+        record_timing('postprocess_reactions.collect_mol_bboxes', time.time() - t0)
+
         if len(bbox_images) > 0:
+            # MolScribe prediction (batched)
+            t0 = time.time()
             predictions = molscribe.predict_images(bbox_images, return_atoms_bonds=True, batch_size=batch_size)
+            record_timing('postprocess_reactions.molscribe.predict_images', time.time() - t0)
 
             for (i, j), pred in zip(bbox_indices, predictions):
                 pred_reactions[i].bboxes[j].set_smiles(pred['smiles'], pred['molfile'], pred['atoms'], pred['bonds'])
+
     if ocr:
+        # OCR for condition text (sequential - known bottleneck)
+        ocr_total_time = 0
+        ocr_call_count = 0
         for reaction in pred_reactions:
             for bbox in reaction.bboxes:
                 if not bbox.is_mol:
+                    t0 = time.time()
                     text = ocr.readtext(bbox.image(), detail=0)
+                    ocr_total_time += time.time() - t0
+                    ocr_call_count += 1
                     bbox.set_text(text)
+        record_timing('postprocess_reactions.easyocr.readtext', ocr_total_time)
+        # Record OCR call count for analysis
+        timing = _get_rxnscribe_timing()
+        timing['ocr_call_count'] = ocr_call_count
+
+    # Record total time
+    timing = _get_rxnscribe_timing()
+    timing['total_time'] = time.time() - total_start
+
     return pred_reactions.to_json()
 
 def postprocess_bboxes(bboxes, image = None, molscribe = None, batch_size = 32):
@@ -496,28 +562,54 @@ def postprocess_bboxes(bboxes, image = None, molscribe = None, batch_size = 32):
     return [bbox.to_json() for bbox in deduplicated]
 
 def postprocess_coref_results(bboxes, image, molscribe = None, ocr = None, batch_size = 32):
+    reset_rxnscribe_timing()
+    total_start = time.time()
+
+    # Image data creation with resize
+    t0 = time.time()
     image_d = ImageData(image = cv2.resize(np.asarray(image), None, fx=3, fy=3))
     bbox_objects = [BBox(bbox = bbox, image_data = image_d, xyxy = True, normalized = True) for bbox in bboxes['bboxes']]
-    if molscribe:
-        
-        bbox_images, bbox_indices = [], []
+    record_timing('postprocess_coref.image_data_creation', time.time() - t0)
 
+    if molscribe:
+        # Collect molecule bboxes
+        t0 = time.time()
+        bbox_images, bbox_indices = [], []
         for i, bbox in enumerate(bbox_objects):
             if bbox.is_mol:
                 bbox_images.append(bbox.image())
                 bbox_indices.append(i)
-        
+        record_timing('postprocess_coref.collect_mol_bboxes', time.time() - t0)
+
         if len(bbox_images) > 0:
+            # MolScribe prediction (batched)
+            t0 = time.time()
             predictions = molscribe.predict_images(bbox_images, return_atoms_bonds=True, batch_size = batch_size)
+            record_timing('postprocess_coref.molscribe.predict_images', time.time() - t0)
 
             for i, pred in zip(bbox_indices, predictions):
                 bbox_objects[i].set_smiles(pred['smiles'], pred['molfile'], pred['atoms'], pred['bonds'])
-    if ocr: 
+
+    if ocr:
+        # OCR for identifier text (sequential - known bottleneck)
+        ocr_total_time = 0
+        ocr_call_count = 0
         for bbox in bbox_objects:
             if bbox.is_idt:
+                t0 = time.time()
                 text = ocr.readtext(bbox.image(), detail = 0)
+                ocr_total_time += time.time() - t0
+                ocr_call_count += 1
                 bbox.set_text(text)
-    
+        record_timing('postprocess_coref.easyocr.readtext', ocr_total_time)
+        # Record OCR call count for analysis
+        timing = _get_rxnscribe_timing()
+        timing['ocr_call_count'] = ocr_call_count
+
+    # Record total time
+    timing = _get_rxnscribe_timing()
+    timing['total_time'] = time.time() - total_start
+
     return {'bboxes': [bbox.to_json() for bbox in bbox_objects], 'corefs': bboxes['corefs']}
         
 

@@ -11,7 +11,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from .pix2seq import build_pix2seq_model
 from .tokenizer import get_tokenizer
 from .dataset import make_transforms
-from .data import postprocess_reactions, postprocess_bboxes, postprocess_coref_results, ReactionImageData, ImageData, CorefImageData
+from .data import postprocess_reactions, postprocess_bboxes, postprocess_coref_results, ReactionImageData, ImageData, CorefImageData, get_rxnscribe_timing, reset_rxnscribe_timing, record_timing
 
 from molscribe import MolScribe
 from huggingface_hub import hf_hub_download
@@ -91,25 +91,79 @@ class RxnScribe:
 
     def predict_images(self, input_images: List, batch_size=16, molscribe=False, ocr=False):
         # images: a list of PIL images
+        import time
+
+        # Reset timing and track overall
+        reset_rxnscribe_timing()
+        overall_start = time.time()
+        timing_data = {
+            'modules': [],
+            'transform_time': 0,
+            'model_inference_time': 0,
+            'postprocess_time': 0,
+            'molscribe_time': 0,
+            'ocr_time': 0,
+            'ocr_call_count': 0,
+        }
+
         device = self.device
         tokenizer = self.tokenizer['reaction']
         predictions = []
+
         for idx in range(0, len(input_images), batch_size):
             batch_images = input_images[idx:idx+batch_size]
+
+            # Transform timing
+            t0 = time.time()
             images, refs = zip(*[self.transform(image) for image in batch_images])
             images = torch.stack(images, dim=0).to(device)
+            timing_data['transform_time'] += time.time() - t0
+
+            # Model inference timing
+            t0 = time.time()
             with torch.no_grad():
                 pred_seqs, pred_scores = self.model(images, max_len=tokenizer.max_len)
+            timing_data['model_inference_time'] += time.time() - t0
+
             for i, (seqs, scores) in enumerate(zip(pred_seqs, pred_scores)):
                 reactions = tokenizer.sequence_to_data(seqs.tolist(), scores.tolist(), scale=refs[i]['scale'])
+
+                # Postprocess timing (includes molscribe and OCR)
+                t0 = time.time()
                 reactions = postprocess_reactions(
                     reactions,
-                    image=input_images[i],
+                    image=input_images[idx + i],
                     molscribe=self.molscribe if molscribe else None,
                     ocr=self.ocr_model if ocr else None
                 )
+                postprocess_elapsed = time.time() - t0
+                timing_data['postprocess_time'] += postprocess_elapsed
+
+                # Capture detailed timing from postprocess
+                pp_timing = get_rxnscribe_timing()
+                for mod in pp_timing.get('modules', []):
+                    if 'molscribe' in mod['name']:
+                        timing_data['molscribe_time'] += mod['time']
+                    elif 'easyocr' in mod['name']:
+                        timing_data['ocr_time'] += mod['time']
+                    timing_data['modules'].append(mod)
+                timing_data['ocr_call_count'] += pp_timing.get('ocr_call_count', 0)
+
                 predictions.append(reactions)
+
+        timing_data['total_time'] = time.time() - overall_start
+        timing_data['num_images'] = len(input_images)
+
+        # Attach timing to predictions (as special key that can be extracted)
+        if predictions:
+            # Store timing in a way that can be retrieved
+            self._last_timing = timing_data
+
         return predictions
+
+    def get_last_timing(self):
+        """Get timing data from the last predict_images call."""
+        return getattr(self, '_last_timing', None)
 
     def predict_image(self, image, **kwargs):
         predictions = self.predict_images([image], **kwargs)
@@ -241,26 +295,78 @@ class MolDetect:
         return reader
     
     def predict_images(self, input_images: List, batch_size = 16, molscribe = False, coref = False, ocr = False):
+        import time
+
+        # Reset timing and track overall
+        reset_rxnscribe_timing()
+        overall_start = time.time()
+        timing_data = {
+            'modules': [],
+            'transform_time': 0,
+            'model_inference_time': 0,
+            'postprocess_time': 0,
+            'molscribe_time': 0,
+            'ocr_time': 0,
+            'ocr_call_count': 0,
+        }
+
         device = self.device
         if not coref:
             tokenizer = self.tokenizer['bbox']
         else:
             tokenizer = self.tokenizer['coref']
         predictions = []
+
         for idx in range(0, len(input_images), batch_size):
             batch_images = input_images[idx:idx+batch_size]
+
+            # Transform timing
+            t0 = time.time()
             images, refs = zip(*[self.transform(image) for image in batch_images])
             images = torch.stack(images, dim=0).to(device)
+            timing_data['transform_time'] += time.time() - t0
+
+            # Model inference timing
+            t0 = time.time()
             with torch.no_grad():
                 pred_seqs, pred_scores = self.model(images, max_len=tokenizer.max_len)
+            timing_data['model_inference_time'] += time.time() - t0
+
             for i, (seqs, scores) in enumerate(zip(pred_seqs, pred_scores)):
                 bboxes = tokenizer.sequence_to_data(seqs.tolist(), scores.tolist(), scale=refs[i]['scale'])
-                if coref: 
-                    bboxes = postprocess_coref_results(bboxes, image = input_images[i], molscribe = self.molscribe if molscribe else None, ocr = self.ocr_model if ocr else None)
+
+                # Postprocess timing
+                t0 = time.time()
+                if coref:
+                    bboxes = postprocess_coref_results(bboxes, image = input_images[idx + i], molscribe = self.molscribe if molscribe else None, ocr = self.ocr_model if ocr else None)
                 if not coref:
-                    bboxes = postprocess_bboxes(bboxes, image = input_images[i], molscribe = self.molscribe if molscribe else None)
+                    bboxes = postprocess_bboxes(bboxes, image = input_images[idx + i], molscribe = self.molscribe if molscribe else None)
+                postprocess_elapsed = time.time() - t0
+                timing_data['postprocess_time'] += postprocess_elapsed
+
+                # Capture detailed timing from postprocess
+                pp_timing = get_rxnscribe_timing()
+                for mod in pp_timing.get('modules', []):
+                    if 'molscribe' in mod['name']:
+                        timing_data['molscribe_time'] += mod['time']
+                    elif 'easyocr' in mod['name']:
+                        timing_data['ocr_time'] += mod['time']
+                    timing_data['modules'].append(mod)
+                timing_data['ocr_call_count'] += pp_timing.get('ocr_call_count', 0)
+
                 predictions.append(bboxes)
+
+        timing_data['total_time'] = time.time() - overall_start
+        timing_data['num_images'] = len(input_images)
+
+        # Store timing for retrieval
+        self._last_timing = timing_data
+
         return predictions
+
+    def get_last_timing(self):
+        """Get timing data from the last predict_images call."""
+        return getattr(self, '_last_timing', None)
 
     def predict_image(self, image, molscribe = False, coref = False, ocr = False):
         predictions = self.predict_images([image], molscribe = molscribe, coref = coref, ocr = ocr)

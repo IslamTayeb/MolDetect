@@ -1,0 +1,25 @@
+Metadata-Version: 2.4
+Name: RxnScribe
+Version: 1.0
+Summary: RxnScribe
+Home-page: https://github.com/Ozymandias314/MolDetect
+Author: Yujie Qian
+Author-email: yujieq@csail.mit.edu
+License-File: LICENSE
+Requires-Dist: torch
+Requires-Dist: numpy>=1.19.5
+Requires-Dist: pandas>=1.2.4
+Requires-Dist: matplotlib>=3.5.3
+Requires-Dist: opencv-python>=4.5.5.64
+Requires-Dist: pycocotools>=2.0.4
+Requires-Dist: pytorch-lightning>=1.8.6
+Requires-Dist: transformers>=4.5.1
+Requires-Dist: huggingface-hub>=0.11.0
+Requires-Dist: MolScribe@ git+https://github.com/CrystalEye42/MolScribe.git@250f683
+Requires-Dist: easyocr>=1.6.2
+Dynamic: author
+Dynamic: author-email
+Dynamic: home-page
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: summary
