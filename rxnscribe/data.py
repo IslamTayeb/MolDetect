@@ -477,7 +477,7 @@ def deduplicate_reactions(reactions):
     return pred_reactions.to_json()
 
 
-def postprocess_reactions(reactions, image_file=None, image=None, molscribe=None, ocr=None, batch_size=32):
+def postprocess_reactions(reactions, image_file=None, image=None, molscribe=None, ocr=None, batch_size=32, skip_molblock=False):
     reset_rxnscribe_timing()
     total_start = time.time()
 
@@ -509,7 +509,7 @@ def postprocess_reactions(reactions, image_file=None, image=None, molscribe=None
         if len(bbox_images) > 0:
             # MolScribe prediction (batched)
             t0 = time.time()
-            predictions = molscribe.predict_images(bbox_images, return_atoms_bonds=True, batch_size=batch_size)
+            predictions = molscribe.predict_images(bbox_images, return_atoms_bonds=True, batch_size=batch_size, skip_molblock=skip_molblock)
             record_timing('postprocess_reactions.molscribe.predict_images', time.time() - t0)
 
             for (i, j), pred in zip(bbox_indices, predictions):
@@ -538,7 +538,7 @@ def postprocess_reactions(reactions, image_file=None, image=None, molscribe=None
 
     return pred_reactions.to_json()
 
-def postprocess_bboxes(bboxes, image = None, molscribe = None, batch_size = 32):
+def postprocess_bboxes(bboxes, image = None, molscribe = None, batch_size = 32, skip_molblock=False):
     image_d = ImageData(image = image)
     bbox_objects = [BBox(bbox = bbox, image_data = image_d, xyxy = True, normalized = True) for bbox in bboxes]
     bbox_objects_no_empty = [bbox for bbox in bbox_objects if not bbox.is_empty]
@@ -554,14 +554,14 @@ def postprocess_bboxes(bboxes, image = None, molscribe = None, batch_size = 32):
                 bbox_indices.append(i)
         
         if len(bbox_images) > 0:
-            predictions = molscribe.predict_images(bbox_images, return_atoms_bonds=True, batch_size = batch_size)
+            predictions = molscribe.predict_images(bbox_images, return_atoms_bonds=True, batch_size = batch_size, skip_molblock=skip_molblock)
 
             for i, pred in zip(bbox_indices, predictions):
                 deduplicated[i].set_smiles(pred['smiles'], pred['molfile'], pred['atoms'], pred['bonds'])
 
     return [bbox.to_json() for bbox in deduplicated]
 
-def postprocess_coref_results(bboxes, image, molscribe = None, ocr = None, batch_size = 32):
+def postprocess_coref_results(bboxes, image, molscribe = None, ocr = None, batch_size = 32, skip_molblock=False):
     reset_rxnscribe_timing()
     total_start = time.time()
 
@@ -584,7 +584,7 @@ def postprocess_coref_results(bboxes, image, molscribe = None, ocr = None, batch
         if len(bbox_images) > 0:
             # MolScribe prediction (batched)
             t0 = time.time()
-            predictions = molscribe.predict_images(bbox_images, return_atoms_bonds=True, batch_size = batch_size)
+            predictions = molscribe.predict_images(bbox_images, return_atoms_bonds=True, batch_size = batch_size, skip_molblock=skip_molblock)
             record_timing('postprocess_coref.molscribe.predict_images', time.time() - t0)
 
             for i, pred in zip(bbox_indices, predictions):

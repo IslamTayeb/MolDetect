@@ -89,7 +89,7 @@ class RxnScribe:
         reader = easyocr.Reader(['en'], gpu=(self.device.type == 'cuda'))
         return reader
 
-    def predict_images(self, input_images: List, batch_size=16, molscribe=False, ocr=False):
+    def predict_images(self, input_images: List, batch_size=16, molscribe=False, ocr=False, skip_molblock=False):
         # images: a list of PIL images
         import time
 
@@ -134,7 +134,8 @@ class RxnScribe:
                     reactions,
                     image=input_images[idx + i],
                     molscribe=self.molscribe if molscribe else None,
-                    ocr=self.ocr_model if ocr else None
+                    ocr=self.ocr_model if ocr else None,
+                    skip_molblock=skip_molblock
                 )
                 postprocess_elapsed = time.time() - t0
                 timing_data['postprocess_time'] += postprocess_elapsed
@@ -226,7 +227,7 @@ class MolDetect:
     def __init__(self, model_path, device = None, coref = False):
         """
         MolDetect Interface
-        :param model_path: path of the model checkpoint. 
+        :param model_path: path of the model checkpoint.
         :param device: torch device, defaults to be CPU.
         """
         args = self._get_args()
@@ -235,7 +236,7 @@ class MolDetect:
         states = torch.load(model_path, map_location = torch.device('cpu'))
         if device is None:
             device = torch.device('cpu')
-        self.device = device 
+        self.device = device
         self.tokenizer = get_tokenizer(args)
         self.model = self.get_model(args, self.tokenizer, self.device, states['state_dict'])
         self.transform = make_transforms('test', augment=False, debug=False)
@@ -273,8 +274,8 @@ class MolDetect:
         args.is_coco = False
         args.use_hf_transformer = True
         return args
-    
-    
+
+
     def get_model(self, args, tokenizer, device, model_states):
         def remove_prefix(state_dict):
             return {k.replace('model.', ''): v for k, v in state_dict.items()}
@@ -285,7 +286,7 @@ class MolDetect:
         model.eval()
         return model
 
-    def get_molscribe(self): 
+    def get_molscribe(self):
         ckpt_path = hf_hub_download("yujieq/MolScribe", "swin_base_char_aux_1m.pth")
         molscribe = MolScribe(ckpt_path, device=self.device)
         return molscribe
@@ -293,8 +294,8 @@ class MolDetect:
     def get_ocr_model(self):
         reader = easyocr.Reader(['en'], gpu = (self.device.type == 'cuda'))
         return reader
-    
-    def predict_images(self, input_images: List, batch_size = 16, molscribe = False, coref = False, ocr = False):
+
+    def predict_images(self, input_images: List, batch_size = 16, molscribe = False, coref = False, ocr = False, skip_molblock=False):
         import time
 
         # Reset timing and track overall
@@ -338,9 +339,9 @@ class MolDetect:
                 # Postprocess timing
                 t0 = time.time()
                 if coref:
-                    bboxes = postprocess_coref_results(bboxes, image = input_images[idx + i], molscribe = self.molscribe if molscribe else None, ocr = self.ocr_model if ocr else None)
+                    bboxes = postprocess_coref_results(bboxes, image = input_images[idx + i], molscribe = self.molscribe if molscribe else None, ocr = self.ocr_model if ocr else None, skip_molblock=skip_molblock)
                 if not coref:
-                    bboxes = postprocess_bboxes(bboxes, image = input_images[idx + i], molscribe = self.molscribe if molscribe else None)
+                    bboxes = postprocess_bboxes(bboxes, image = input_images[idx + i], molscribe = self.molscribe if molscribe else None, skip_molblock=skip_molblock)
                 postprocess_elapsed = time.time() - t0
                 timing_data['postprocess_time'] += postprocess_elapsed
 
@@ -368,21 +369,21 @@ class MolDetect:
         """Get timing data from the last predict_images call."""
         return getattr(self, '_last_timing', None)
 
-    def predict_image(self, image, molscribe = False, coref = False, ocr = False):
-        predictions = self.predict_images([image], molscribe = molscribe, coref = coref, ocr = ocr)
+    def predict_image(self, image, molscribe = False, coref = False, ocr = False, skip_molblock=False):
+        predictions = self.predict_images([image], molscribe = molscribe, coref = coref, ocr = ocr, skip_molblock=skip_molblock)
         return predictions[0]
 
-    def predict_image_files(self, image_files: List, batch_size = 16, molscribe = False, coref = False, ocr = False):
+    def predict_image_files(self, image_files: List, batch_size = 16, molscribe = False, coref = False, ocr = False, skip_molblock=False):
         input_images = []
         for path in image_files:
             image = PIL.Image.open(path).convert("RGB")
             input_images.append(image)
-        return self.predict_images(input_images, batch_size = batch_size, molscribe = molscribe, coref = coref, ocr = ocr)
+        return self.predict_images(input_images, batch_size = batch_size, molscribe = molscribe, coref = coref, ocr = ocr, skip_molblock=skip_molblock)
 
-    def predict_image_file(self, image_file: str, molscribe = False, coref = False, ocr = False, **kwargs):
-        predictions = self.predict_image_files([image_file], molscribe = molscribe, coref = coref, ocr = ocr)
+    def predict_image_file(self, image_file: str, molscribe = False, coref = False, ocr = False, skip_molblock=False, **kwargs):
+        predictions = self.predict_image_files([image_file], molscribe = molscribe, coref = coref, ocr = ocr, skip_molblock=skip_molblock)
         return predictions[0]
-    
+
     def draw_bboxes(self, predictions, image=None, image_file=None, coref = False):
         results = []
         assert image or image_file
@@ -400,6 +401,3 @@ class MolDetect:
         results.append(np.asarray(buf))
         plt.close(fig)
         return results
-            
-
-
