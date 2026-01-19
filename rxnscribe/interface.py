@@ -20,11 +20,12 @@ import easyocr
 
 class RxnScribe:
 
-    def __init__(self, model_path, device=None):
+    def __init__(self, model_path, device=None, molscribe=None):
         """
         RxnScribe Interface
         :param model_path: path of the model checkpoint.
         :param device: torch device, defaults to be CPU.
+        :param molscribe: optional external MolScribe instance (for caching/sharing)
         """
         args = self._get_args()
         args.format = 'reaction'
@@ -35,7 +36,7 @@ class RxnScribe:
         self.tokenizer = get_tokenizer(args)
         self.model = self.get_model(args, self.tokenizer, self.device, states['state_dict'])
         self.transform = make_transforms('test', augment=False, debug=False)
-        self.molscribe = self.get_molscribe()
+        self.molscribe = molscribe if molscribe is not None else self.get_molscribe()
         self.ocr_model = self.get_ocr_model()
 
     def _get_args(self):
@@ -127,6 +128,10 @@ class RxnScribe:
 
             for i, (seqs, scores) in enumerate(zip(pred_seqs, pred_scores)):
                 reactions = tokenizer.sequence_to_data(seqs.tolist(), scores.tolist(), scale=refs[i]['scale'])
+
+                # Set figure context for cache lookup
+                if molscribe and self.molscribe is not None:
+                    self.molscribe.figure_context = idx + i
 
                 # Postprocess timing (includes molscribe and OCR)
                 t0 = time.time()
@@ -224,11 +229,12 @@ class RxnScribe:
 
 class MolDetect:
 
-    def __init__(self, model_path, device = None, coref = False):
+    def __init__(self, model_path, device = None, coref = False, molscribe = None):
         """
         MolDetect Interface
         :param model_path: path of the model checkpoint.
         :param device: torch device, defaults to be CPU.
+        :param molscribe: optional external MolScribe instance (for caching/sharing)
         """
         args = self._get_args()
         if not coref: args.format = 'bbox'
@@ -241,7 +247,7 @@ class MolDetect:
         self.model = self.get_model(args, self.tokenizer, self.device, states['state_dict'])
         self.transform = make_transforms('test', augment=False, debug=False)
         self.ocr_model = self.get_ocr_model()
-        self.molscribe = self.get_molscribe()
+        self.molscribe = molscribe if molscribe is not None else self.get_molscribe()
 
     def _get_args(self):
         parser = argparse.ArgumentParser()
@@ -359,6 +365,10 @@ class MolDetect:
             # Original per-image postprocessing for non-coref mode
             predictions = []
             for img_idx, raw_bboxes in all_raw_bboxes:
+                # Set figure context for cache lookup
+                if molscribe and self.molscribe is not None:
+                    self.molscribe.figure_context = img_idx
+
                 t0 = time.time()
                 bboxes = postprocess_bboxes(
                     raw_bboxes,
@@ -421,19 +431,37 @@ class MolDetect:
             all_image_data.append((img_idx, bbox_objects, corefs))
         timing_data['modules'].append({'name': 'coref_batched.prepare_image_data', 'time': time.time() - t0})
 
-        # Phase 2: Collect ALL molecule bboxes across ALL images
+        # Phase 2: Collect ALL molecule bboxes across ALL images (with cache checking)
         if molscribe:
+            # Check if cache is available
+            has_cache = hasattr(molscribe, 'find_cached_smiles') and hasattr(molscribe, 'cache_smiles')
+
             t0 = time.time()
+            cache_hits = []  # List of (list_idx, bbox_idx, cached_pred)
             all_mol_images = []
-            mol_indices = []  # List of (list_idx, bbox_idx)
+            mol_indices = []  # List of (list_idx, bbox_idx, img_idx, bbox_coords)
             for list_idx, (img_idx, bbox_objects, corefs) in enumerate(all_image_data):
                 for bbox_idx, bbox in enumerate(bbox_objects):
                     if bbox.is_mol:
-                        all_mol_images.append(bbox.image())
-                        mol_indices.append((list_idx, bbox_idx))
-            timing_data['modules'].append({'name': 'coref_batched.collect_mol_bboxes', 'time': time.time() - t0})
+                        bbox_coords = (bbox.x1, bbox.y1, bbox.x2, bbox.y2)
 
-            # Phase 3: ONE batched MolScribe call for ALL molecules
+                        # Try cache lookup if available (use img_idx as figure_id)
+                        if has_cache:
+                            cached = molscribe.find_cached_smiles(img_idx, bbox_coords)
+                            if cached is not None:
+                                cache_hits.append((list_idx, bbox_idx, cached))
+                                continue
+
+                        all_mol_images.append(bbox.image())
+                        mol_indices.append((list_idx, bbox_idx, img_idx, bbox_coords))
+            timing_data['modules'].append({
+                'name': 'coref_batched.collect_mol_bboxes',
+                'time': time.time() - t0,
+                'cache_hits': len(cache_hits),
+                'cache_misses': len(all_mol_images)
+            })
+
+            # Phase 3: ONE batched MolScribe call for ALL molecules (cache misses only)
             if all_mol_images:
                 t0 = time.time()
                 predictions = molscribe.predict_images(
@@ -450,13 +478,25 @@ class MolDetect:
                     'num_molecules': len(all_mol_images)
                 })
 
-                # Phase 4: Distribute results back to each image's bboxes
+                # Phase 4: Distribute results back to each image's bboxes and store in cache
                 t0 = time.time()
-                for (list_idx, bbox_idx), pred in zip(mol_indices, predictions):
+                for (list_idx, bbox_idx, img_idx, bbox_coords), pred in zip(mol_indices, predictions):
                     all_image_data[list_idx][1][bbox_idx].set_smiles(
                         pred['smiles'], pred['molfile'], pred['atoms'], pred['bonds']
                     )
+                    # Store in cache
+                    if has_cache:
+                        molscribe.cache_smiles(img_idx, bbox_coords, pred)
                 timing_data['modules'].append({'name': 'coref_batched.distribute_results', 'time': time.time() - t0})
+
+            # Apply cache hits
+            if cache_hits:
+                t0 = time.time()
+                for list_idx, bbox_idx, pred in cache_hits:
+                    all_image_data[list_idx][1][bbox_idx].set_smiles(
+                        pred['smiles'], pred.get('molfile'), pred.get('atoms'), pred.get('bonds')
+                    )
+                timing_data['modules'].append({'name': 'coref_batched.apply_cache_hits', 'time': time.time() - t0})
 
         # Phase 5: OCR for identifiers (still sequential - known bottleneck)
         if ocr:

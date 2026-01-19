@@ -496,14 +496,28 @@ def postprocess_reactions(reactions, image_file=None, image=None, molscribe=None
     record_timing('postprocess_reactions.deduplication', time.time() - t0)
 
     if molscribe:
-        # Collect molecule bboxes
+        # Check if cache is available
+        has_cache = hasattr(molscribe, 'find_cached_smiles') and hasattr(molscribe, 'cache_smiles')
+        figure_id = getattr(molscribe, 'figure_context', None) if has_cache else None
+
+        # Collect molecule bboxes with cache checking
         t0 = time.time()
+        cache_hits = []
         bbox_images, bbox_indices = [], []
         for i, reaction in enumerate(pred_reactions):
             for j, bbox in enumerate(reaction.bboxes):
                 if bbox.is_mol:
+                    bbox_coords = (bbox.x1, bbox.y1, bbox.x2, bbox.y2)
+
+                    # Try cache lookup if available
+                    if has_cache and figure_id is not None:
+                        cached = molscribe.find_cached_smiles(figure_id, bbox_coords)
+                        if cached is not None:
+                            cache_hits.append((i, j, cached))
+                            continue
+
                     bbox_images.append(bbox.image())
-                    bbox_indices.append((i, j))
+                    bbox_indices.append((i, j, bbox_coords))
         record_timing('postprocess_reactions.collect_mol_bboxes', time.time() - t0)
 
         if len(bbox_images) > 0:
@@ -512,8 +526,15 @@ def postprocess_reactions(reactions, image_file=None, image=None, molscribe=None
             predictions = molscribe.predict_images(bbox_images, return_atoms_bonds=True, batch_size=batch_size, skip_molblock=skip_molblock)
             record_timing('postprocess_reactions.molscribe.predict_images', time.time() - t0)
 
-            for (i, j), pred in zip(bbox_indices, predictions):
+            for (i, j, bbox_coords), pred in zip(bbox_indices, predictions):
                 pred_reactions[i].bboxes[j].set_smiles(pred['smiles'], pred['molfile'], pred['atoms'], pred['bonds'])
+                # Store in cache
+                if has_cache and figure_id is not None:
+                    molscribe.cache_smiles(figure_id, bbox_coords, pred)
+
+        # Apply cache hits
+        for i, j, pred in cache_hits:
+            pred_reactions[i].bboxes[j].set_smiles(pred['smiles'], pred.get('molfile'), pred.get('atoms'), pred.get('bonds'))
 
     if ocr:
         # OCR for condition text (sequential - known bottleneck)
@@ -546,18 +567,40 @@ def postprocess_bboxes(bboxes, image = None, molscribe = None, batch_size = 32, 
     deduplicated = deduplicate_bboxes(bbox_objects_no_empty)
 
     if molscribe:
+        # Check if cache is available
+        has_cache = hasattr(molscribe, 'find_cached_smiles') and hasattr(molscribe, 'cache_smiles')
+        figure_id = getattr(molscribe, 'figure_context', None) if has_cache else None
+
+        cache_hits = []
         bbox_images, bbox_indices = [], []
 
         for i, bbox in enumerate(deduplicated):
             if bbox.is_mol:
+                bbox_coords = (bbox.x1, bbox.y1, bbox.x2, bbox.y2)
+
+                # Try cache lookup if available
+                if has_cache and figure_id is not None:
+                    cached = molscribe.find_cached_smiles(figure_id, bbox_coords)
+                    if cached is not None:
+                        cache_hits.append((i, cached))
+                        continue
+
                 bbox_images.append(bbox.image())
-                bbox_indices.append(i)
-        
+                bbox_indices.append((i, bbox_coords))
+
+        # Process cache misses with MolScribe
         if len(bbox_images) > 0:
             predictions = molscribe.predict_images(bbox_images, return_atoms_bonds=True, batch_size = batch_size, skip_molblock=skip_molblock)
 
-            for i, pred in zip(bbox_indices, predictions):
+            for (i, bbox_coords), pred in zip(bbox_indices, predictions):
                 deduplicated[i].set_smiles(pred['smiles'], pred['molfile'], pred['atoms'], pred['bonds'])
+                # Store in cache
+                if has_cache and figure_id is not None:
+                    molscribe.cache_smiles(figure_id, bbox_coords, pred)
+
+        # Apply cache hits
+        for i, pred in cache_hits:
+            deduplicated[i].set_smiles(pred['smiles'], pred.get('molfile'), pred.get('atoms'), pred.get('bonds'))
 
     return [bbox.to_json() for bbox in deduplicated]
 
