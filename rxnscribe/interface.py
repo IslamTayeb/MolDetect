@@ -316,8 +316,9 @@ class MolDetect:
             tokenizer = self.tokenizer['bbox']
         else:
             tokenizer = self.tokenizer['coref']
-        predictions = []
 
+        # Phase 1: Model inference for all images (batched)
+        all_raw_bboxes = []
         for idx in range(0, len(input_images), batch_size):
             batch_images = input_images[idx:idx+batch_size]
 
@@ -335,13 +336,36 @@ class MolDetect:
 
             for i, (seqs, scores) in enumerate(zip(pred_seqs, pred_scores)):
                 bboxes = tokenizer.sequence_to_data(seqs.tolist(), scores.tolist(), scale=refs[i]['scale'])
+                all_raw_bboxes.append((idx + i, bboxes))
 
-                # Postprocess timing
+        # Phase 2: Postprocessing
+        if coref:
+            # Use batched postprocessing for coref mode (batches MolScribe across ALL images)
+            t0 = time.time()
+            predictions, batch_timing = self._postprocess_coref_batched(
+                input_images,
+                all_raw_bboxes,
+                molscribe=self.molscribe if molscribe else None,
+                ocr=self.ocr_model if ocr else None,
+                batch_size=batch_size,
+                skip_molblock=skip_molblock
+            )
+            timing_data['postprocess_time'] = time.time() - t0
+            timing_data['molscribe_time'] = batch_timing.get('molscribe_time', 0)
+            timing_data['ocr_time'] = batch_timing.get('ocr_time', 0)
+            timing_data['ocr_call_count'] = batch_timing.get('ocr_call_count', 0)
+            timing_data['modules'].extend(batch_timing.get('modules', []))
+        else:
+            # Original per-image postprocessing for non-coref mode
+            predictions = []
+            for img_idx, raw_bboxes in all_raw_bboxes:
                 t0 = time.time()
-                if coref:
-                    bboxes = postprocess_coref_results(bboxes, image = input_images[idx + i], molscribe = self.molscribe if molscribe else None, ocr = self.ocr_model if ocr else None, skip_molblock=skip_molblock)
-                if not coref:
-                    bboxes = postprocess_bboxes(bboxes, image = input_images[idx + i], molscribe = self.molscribe if molscribe else None, skip_molblock=skip_molblock)
+                bboxes = postprocess_bboxes(
+                    raw_bboxes,
+                    image=input_images[img_idx],
+                    molscribe=self.molscribe if molscribe else None,
+                    skip_molblock=skip_molblock
+                )
                 postprocess_elapsed = time.time() - t0
                 timing_data['postprocess_time'] += postprocess_elapsed
 
@@ -350,10 +374,7 @@ class MolDetect:
                 for mod in pp_timing.get('modules', []):
                     if 'molscribe' in mod['name']:
                         timing_data['molscribe_time'] += mod['time']
-                    elif 'easyocr' in mod['name']:
-                        timing_data['ocr_time'] += mod['time']
                     timing_data['modules'].append(mod)
-                timing_data['ocr_call_count'] += pp_timing.get('ocr_call_count', 0)
 
                 predictions.append(bboxes)
 
@@ -368,6 +389,103 @@ class MolDetect:
     def get_last_timing(self):
         """Get timing data from the last predict_images call."""
         return getattr(self, '_last_timing', None)
+
+    def _postprocess_coref_batched(self, input_images, all_raw_bboxes, molscribe, ocr, batch_size, skip_molblock):
+        """
+        Batch MolScribe across all images for coref postprocessing.
+
+        Instead of calling molscribe per-image, we collect ALL molecule bboxes
+        from ALL images and run a single batched molscribe.predict_images() call.
+        """
+        import time
+        import cv2
+        from .data import ImageData, BBox, record_timing, _get_rxnscribe_timing
+
+        timing_data = {
+            'modules': [],
+            'molscribe_time': 0,
+            'ocr_time': 0,
+            'ocr_call_count': 0,
+        }
+
+        # Phase 1: Prepare ImageData and BBox objects for all images
+        t0 = time.time()
+        all_image_data = []
+        for img_idx, raw_bboxes in all_raw_bboxes:
+            image = input_images[img_idx]
+            # Resize image 3x as in original postprocess_coref_results
+            image_d = ImageData(image=cv2.resize(np.asarray(image), None, fx=3, fy=3))
+            bbox_objects = [BBox(bbox=bbox, image_data=image_d, xyxy=True, normalized=True)
+                           for bbox in raw_bboxes['bboxes']]
+            corefs = raw_bboxes['corefs']
+            all_image_data.append((img_idx, bbox_objects, corefs))
+        timing_data['modules'].append({'name': 'coref_batched.prepare_image_data', 'time': time.time() - t0})
+
+        # Phase 2: Collect ALL molecule bboxes across ALL images
+        if molscribe:
+            t0 = time.time()
+            all_mol_images = []
+            mol_indices = []  # List of (list_idx, bbox_idx)
+            for list_idx, (img_idx, bbox_objects, corefs) in enumerate(all_image_data):
+                for bbox_idx, bbox in enumerate(bbox_objects):
+                    if bbox.is_mol:
+                        all_mol_images.append(bbox.image())
+                        mol_indices.append((list_idx, bbox_idx))
+            timing_data['modules'].append({'name': 'coref_batched.collect_mol_bboxes', 'time': time.time() - t0})
+
+            # Phase 3: ONE batched MolScribe call for ALL molecules
+            if all_mol_images:
+                t0 = time.time()
+                predictions = molscribe.predict_images(
+                    all_mol_images,
+                    return_atoms_bonds=True,
+                    batch_size=batch_size,
+                    skip_molblock=skip_molblock
+                )
+                molscribe_time = time.time() - t0
+                timing_data['molscribe_time'] = molscribe_time
+                timing_data['modules'].append({
+                    'name': 'coref_batched.molscribe.predict_images',
+                    'time': molscribe_time,
+                    'num_molecules': len(all_mol_images)
+                })
+
+                # Phase 4: Distribute results back to each image's bboxes
+                t0 = time.time()
+                for (list_idx, bbox_idx), pred in zip(mol_indices, predictions):
+                    all_image_data[list_idx][1][bbox_idx].set_smiles(
+                        pred['smiles'], pred['molfile'], pred['atoms'], pred['bonds']
+                    )
+                timing_data['modules'].append({'name': 'coref_batched.distribute_results', 'time': time.time() - t0})
+
+        # Phase 5: OCR for identifiers (still sequential - known bottleneck)
+        if ocr:
+            t0 = time.time()
+            ocr_call_count = 0
+            for list_idx, (img_idx, bbox_objects, corefs) in enumerate(all_image_data):
+                for bbox in bbox_objects:
+                    if bbox.is_idt:
+                        text = ocr.readtext(bbox.image(), detail=0)
+                        bbox.set_text(text)
+                        ocr_call_count += 1
+            ocr_time = time.time() - t0
+            timing_data['ocr_time'] = ocr_time
+            timing_data['ocr_call_count'] = ocr_call_count
+            timing_data['modules'].append({
+                'name': 'coref_batched.easyocr.readtext',
+                'time': ocr_time,
+                'num_calls': ocr_call_count
+            })
+
+        # Phase 6: Build final results
+        results = []
+        for img_idx, bbox_objects, corefs in all_image_data:
+            results.append({
+                'bboxes': [b.to_json() for b in bbox_objects],
+                'corefs': corefs
+            })
+
+        return results, timing_data
 
     def predict_image(self, image, molscribe = False, coref = False, ocr = False, skip_molblock=False):
         predictions = self.predict_images([image], molscribe = molscribe, coref = coref, ocr = ocr, skip_molblock=skip_molblock)
