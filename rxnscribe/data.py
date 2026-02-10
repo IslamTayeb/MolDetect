@@ -6,6 +6,7 @@ import matplotlib.colors as colors
 import matplotlib.patches as patches
 from PIL import Image
 from threading import local
+from concurrent.futures import ThreadPoolExecutor
 
 # Thread-local storage for timing data (to avoid conflicts in parallel execution)
 _rxnscribe_timing = local()
@@ -537,21 +538,27 @@ def postprocess_reactions(reactions, image_file=None, image=None, molscribe=None
             pred_reactions[i].bboxes[j].set_smiles(pred['smiles'], pred.get('molfile'), pred.get('atoms'), pred.get('bonds'))
 
     if ocr:
-        # OCR for condition text (sequential - known bottleneck)
-        ocr_total_time = 0
-        ocr_call_count = 0
+        # OCR for condition text — parallel with ThreadPoolExecutor
+        t0_ocr = time.time()
+        ocr_tasks = []
         for reaction in pred_reactions:
             for bbox in reaction.bboxes:
                 if not bbox.is_mol:
-                    t0 = time.time()
-                    text = ocr.readtext(bbox.image(), detail=0)
-                    ocr_total_time += time.time() - t0
-                    ocr_call_count += 1
-                    bbox.set_text(text)
+                    ocr_tasks.append(bbox)
+
+        def _ocr_single(bbox):
+            return ocr.readtext(bbox.image(), detail=0)
+
+        if ocr_tasks:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                ocr_results = list(executor.map(_ocr_single, ocr_tasks))
+            for bbox, text in zip(ocr_tasks, ocr_results):
+                bbox.set_text(text)
+
+        ocr_total_time = time.time() - t0_ocr
         record_timing('postprocess_reactions.easyocr.readtext', ocr_total_time)
-        # Record OCR call count for analysis
         timing = _get_rxnscribe_timing()
-        timing['ocr_call_count'] = ocr_call_count
+        timing['ocr_call_count'] = len(ocr_tasks)
 
     # Record total time
     timing = _get_rxnscribe_timing()

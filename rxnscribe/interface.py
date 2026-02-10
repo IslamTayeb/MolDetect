@@ -1,6 +1,7 @@
 import os
 import argparse
 from typing import List
+from concurrent.futures import ThreadPoolExecutor
 import PIL
 import torch
 from torch.profiler import profile, record_function, ProfilerActivity
@@ -498,23 +499,31 @@ class MolDetect:
                     )
                 timing_data['modules'].append({'name': 'coref_batched.apply_cache_hits', 'time': time.time() - t0})
 
-        # Phase 5: OCR for identifiers (still sequential - known bottleneck)
+        # Phase 5: OCR for identifiers — parallel with ThreadPoolExecutor
         if ocr:
             t0 = time.time()
-            ocr_call_count = 0
+            ocr_tasks = []
             for list_idx, (img_idx, bbox_objects, corefs) in enumerate(all_image_data):
                 for bbox in bbox_objects:
                     if bbox.is_idt:
-                        text = ocr.readtext(bbox.image(), detail=0)
-                        bbox.set_text(text)
-                        ocr_call_count += 1
+                        ocr_tasks.append(bbox)
+
+            def _ocr_single(bbox):
+                return ocr.readtext(bbox.image(), detail=0)
+
+            if ocr_tasks:
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    ocr_results = list(executor.map(_ocr_single, ocr_tasks))
+                for bbox, text in zip(ocr_tasks, ocr_results):
+                    bbox.set_text(text)
+
             ocr_time = time.time() - t0
             timing_data['ocr_time'] = ocr_time
-            timing_data['ocr_call_count'] = ocr_call_count
+            timing_data['ocr_call_count'] = len(ocr_tasks)
             timing_data['modules'].append({
                 'name': 'coref_batched.easyocr.readtext',
                 'time': ocr_time,
-                'num_calls': ocr_call_count
+                'num_calls': len(ocr_tasks)
             })
 
         # Phase 6: Build final results
