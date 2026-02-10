@@ -478,6 +478,20 @@ def deduplicate_reactions(reactions):
     return pred_reactions.to_json()
 
 
+def postprocess_reactions_deferred(reactions, image=None):
+    """Parse reactions and deduplicate, but skip MolScribe and OCR.
+
+    Returns:
+        ReactionSet with deduplicated Reaction objects (bboxes still have .image() available)
+    """
+    image_data = ReactionImageData(predictions=reactions, image=image)
+    pred_reactions = image_data.pred_reactions
+    for r in pred_reactions:
+        r.deduplicate()
+    pred_reactions.deduplicate()
+    return pred_reactions
+
+
 def postprocess_reactions(reactions, image_file=None, image=None, molscribe=None, ocr=None, batch_size=32, skip_molblock=False):
     reset_rxnscribe_timing()
     total_start = time.time()

@@ -12,7 +12,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from .pix2seq import build_pix2seq_model
 from .tokenizer import get_tokenizer
 from .dataset import make_transforms
-from .data import postprocess_reactions, postprocess_bboxes, postprocess_coref_results, ReactionImageData, ImageData, CorefImageData, get_rxnscribe_timing, reset_rxnscribe_timing, record_timing
+from .data import postprocess_reactions, postprocess_reactions_deferred, postprocess_bboxes, postprocess_coref_results, ReactionImageData, ImageData, CorefImageData, get_rxnscribe_timing, reset_rxnscribe_timing, record_timing
 
 from molscribe import MolScribe
 from huggingface_hub import hf_hub_download
@@ -94,6 +94,7 @@ class RxnScribe:
     def predict_images(self, input_images: List, batch_size=16, molscribe=False, ocr=False, skip_molblock=False):
         # images: a list of PIL images
         import time
+        from .data import _get_rxnscribe_timing
 
         # Reset timing and track overall
         reset_rxnscribe_timing()
@@ -110,7 +111,9 @@ class RxnScribe:
 
         device = self.device
         tokenizer = self.tokenizer['reaction']
-        predictions = []
+
+        # Phase 1: Batch model inference + sequence parsing for ALL images
+        all_reaction_sets = []  # List of (img_idx, ReactionSet)
 
         for idx in range(0, len(input_images), batch_size):
             batch_images = input_images[idx:idx+batch_size]
@@ -129,41 +132,110 @@ class RxnScribe:
 
             for i, (seqs, scores) in enumerate(zip(pred_seqs, pred_scores)):
                 reactions = tokenizer.sequence_to_data(seqs.tolist(), scores.tolist(), scale=refs[i]['scale'])
+                # Deferred postprocess: parse + deduplicate, no MolScribe/OCR
+                pred_reactions = postprocess_reactions_deferred(reactions, image=input_images[idx + i])
+                all_reaction_sets.append((idx + i, pred_reactions))
 
-                # Set figure context for cache lookup
-                if molscribe and self.molscribe is not None:
-                    self.molscribe.figure_context = idx + i
+        # Phase 2: Collect ALL molecule bboxes across ALL images → ONE MolScribe call
+        if molscribe and self.molscribe is not None:
+            has_cache = hasattr(self.molscribe, 'find_cached_smiles') and hasattr(self.molscribe, 'cache_smiles')
 
-                # Postprocess timing (includes molscribe and OCR)
+            t0 = time.time()
+            cache_hits = []  # (list_idx, rxn_idx, bbox_idx, pred)
+            all_mol_images = []
+            mol_indices = []  # (list_idx, rxn_idx, bbox_idx, figure_id, bbox_coords)
+
+            for list_idx, (img_idx, pred_reactions) in enumerate(all_reaction_sets):
+                figure_id = img_idx if has_cache else None
+                for rxn_idx, reaction in enumerate(pred_reactions):
+                    for bbox_idx, bbox in enumerate(reaction.bboxes):
+                        if bbox.is_mol:
+                            bbox_coords = (bbox.x1, bbox.y1, bbox.x2, bbox.y2)
+                            # Try cache lookup
+                            if has_cache and figure_id is not None:
+                                cached = self.molscribe.find_cached_smiles(figure_id, bbox_coords)
+                                if cached is not None:
+                                    cache_hits.append((list_idx, rxn_idx, bbox_idx, cached))
+                                    continue
+                            all_mol_images.append(bbox.image())
+                            mol_indices.append((list_idx, rxn_idx, bbox_idx, figure_id, bbox_coords))
+
+            timing_data['modules'].append({
+                'name': 'rxn_batched.collect_mol_bboxes',
+                'time': time.time() - t0,
+                'cache_hits': len(cache_hits),
+                'cache_misses': len(all_mol_images)
+            })
+
+            # ONE batched MolScribe call for ALL molecules across ALL images
+            if all_mol_images:
                 t0 = time.time()
-                reactions = postprocess_reactions(
-                    reactions,
-                    image=input_images[idx + i],
-                    molscribe=self.molscribe if molscribe else None,
-                    ocr=self.ocr_model if ocr else None,
-                    skip_molblock=skip_molblock
+                predictions = self.molscribe.predict_images(
+                    all_mol_images, return_atoms_bonds=True,
+                    batch_size=batch_size, skip_molblock=skip_molblock
                 )
-                postprocess_elapsed = time.time() - t0
-                timing_data['postprocess_time'] += postprocess_elapsed
+                molscribe_time = time.time() - t0
+                timing_data['molscribe_time'] = molscribe_time
+                timing_data['modules'].append({
+                    'name': 'rxn_batched.molscribe.predict_images',
+                    'time': molscribe_time,
+                    'num_molecules': len(all_mol_images)
+                })
 
-                # Capture detailed timing from postprocess
-                pp_timing = get_rxnscribe_timing()
-                for mod in pp_timing.get('modules', []):
-                    if 'molscribe' in mod['name']:
-                        timing_data['molscribe_time'] += mod['time']
-                    elif 'easyocr' in mod['name']:
-                        timing_data['ocr_time'] += mod['time']
-                    timing_data['modules'].append(mod)
-                timing_data['ocr_call_count'] += pp_timing.get('ocr_call_count', 0)
+                # Distribute results back
+                for (list_idx, rxn_idx, bbox_idx, figure_id, bbox_coords), pred in zip(mol_indices, predictions):
+                    _, pred_reactions = all_reaction_sets[list_idx]
+                    pred_reactions[rxn_idx].bboxes[bbox_idx].set_smiles(
+                        pred['smiles'], pred['molfile'], pred['atoms'], pred['bonds']
+                    )
+                    if has_cache and figure_id is not None:
+                        self.molscribe.cache_smiles(figure_id, bbox_coords, pred)
 
-                predictions.append(reactions)
+            # Apply cache hits
+            if cache_hits:
+                for list_idx, rxn_idx, bbox_idx, pred in cache_hits:
+                    _, pred_reactions = all_reaction_sets[list_idx]
+                    pred_reactions[rxn_idx].bboxes[bbox_idx].set_smiles(
+                        pred['smiles'], pred.get('molfile'), pred.get('atoms'), pred.get('bonds')
+                    )
+
+        # Phase 3: Collect ALL OCR bboxes across ALL images → ONE threaded OCR batch
+        if ocr:
+            t0 = time.time()
+            ocr_tasks = []  # list of bbox objects
+            for _, pred_reactions in all_reaction_sets:
+                for reaction in pred_reactions:
+                    for bbox in reaction.bboxes:
+                        if not bbox.is_mol:
+                            ocr_tasks.append(bbox)
+
+            def _ocr_single(bbox):
+                return self.ocr_model.readtext(bbox.image(), detail=0)
+
+            if ocr_tasks:
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    ocr_results = list(executor.map(_ocr_single, ocr_tasks))
+                for bbox, text in zip(ocr_tasks, ocr_results):
+                    bbox.set_text(text)
+
+            ocr_time = time.time() - t0
+            timing_data['ocr_time'] = ocr_time
+            timing_data['ocr_call_count'] = len(ocr_tasks)
+            timing_data['modules'].append({
+                'name': 'rxn_batched.easyocr.readtext',
+                'time': ocr_time,
+                'num_calls': len(ocr_tasks)
+            })
+
+        # Phase 4: Convert to JSON output
+        predictions = []
+        for _, pred_reactions in all_reaction_sets:
+            predictions.append(pred_reactions.to_json())
 
         timing_data['total_time'] = time.time() - overall_start
         timing_data['num_images'] = len(input_images)
 
-        # Attach timing to predictions (as special key that can be extracted)
         if predictions:
-            # Store timing in a way that can be retrieved
             self._last_timing = timing_data
 
         return predictions
