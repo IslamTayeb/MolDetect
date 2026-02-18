@@ -118,15 +118,17 @@ class RxnScribe:
         for idx in range(0, len(input_images), batch_size):
             batch_images = input_images[idx:idx+batch_size]
 
-            # Transform timing
+            # Transform timing — parallel with ThreadPoolExecutor
             t0 = time.time()
-            images, refs = zip(*[self.transform(image) for image in batch_images])
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                transformed = list(pool.map(self.transform, batch_images))
+            images, refs = zip(*transformed)
             images = torch.stack(images, dim=0).to(device)
             timing_data['transform_time'] += time.time() - t0
 
-            # Model inference timing
+            # Model inference timing — FP16 autocast
             t0 = time.time()
-            with torch.no_grad():
+            with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16, enabled=(device.type == 'cuda')):
                 pred_seqs, pred_scores = self.model(images, max_len=tokenizer.max_len)
             timing_data['model_inference_time'] += time.time() - t0
 
@@ -401,15 +403,17 @@ class MolDetect:
         for idx in range(0, len(input_images), batch_size):
             batch_images = input_images[idx:idx+batch_size]
 
-            # Transform timing
+            # Transform timing — parallel with ThreadPoolExecutor
             t0 = time.time()
-            images, refs = zip(*[self.transform(image) for image in batch_images])
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                transformed = list(pool.map(self.transform, batch_images))
+            images, refs = zip(*transformed)
             images = torch.stack(images, dim=0).to(device)
             timing_data['transform_time'] += time.time() - t0
 
-            # Model inference timing
+            # Model inference timing — FP16 autocast
             t0 = time.time()
-            with torch.no_grad():
+            with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16, enabled=(device.type == 'cuda')):
                 pred_seqs, pred_scores = self.model(images, max_len=tokenizer.max_len)
             timing_data['model_inference_time'] += time.time() - t0
 
