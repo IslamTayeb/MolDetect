@@ -246,6 +246,110 @@ class RxnScribe:
         """Get timing data from the last predict_images call."""
         return getattr(self, '_last_timing', None)
 
+    def infer_gpu(self, input_images: List, batch_size=16):
+        """
+        GPU-only inference: transform + model forward + deferred postprocess.
+        Returns raw ReactionSets (no MolScribe, no OCR, no JSON conversion).
+
+        Use with collect_mol_crops(), collect_ocr_tasks(), apply_smiles(),
+        apply_ocr(), and finalize() for the concurrent pipeline.
+
+        Returns:
+            List of (img_idx, ReactionSet) tuples
+        """
+        device = self.device
+        tokenizer = self.tokenizer['reaction']
+        all_reaction_sets = []
+
+        for idx in range(0, len(input_images), batch_size):
+
+            batch_images = input_images[idx:idx+batch_size]
+
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                transformed = list(pool.map(self.transform, batch_images))
+            images, refs = zip(*transformed)
+            images = torch.stack(images, dim=0)
+            if device.type == 'cuda':
+                images = images.pin_memory().to(device, non_blocking=True)
+            else:
+                images = images.to(device)
+
+            with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16, enabled=(device.type == 'cuda')):
+                pred_seqs, pred_scores = self.model(images, max_len=tokenizer.max_len)
+
+            for i, (seqs, scores) in enumerate(zip(pred_seqs, pred_scores)):
+                reactions = tokenizer.sequence_to_data(seqs.tolist(), scores.tolist(), scale=refs[i]['scale'])
+                pred_reactions = postprocess_reactions_deferred(reactions, image=input_images[idx + i])
+                all_reaction_sets.append((idx + i, pred_reactions))
+
+        return all_reaction_sets
+
+    @staticmethod
+    def collect_mol_crops(all_reaction_sets):
+        """
+        CPU: collect all molecule image crops from ReactionSets.
+
+        Args:
+            all_reaction_sets: List of (img_idx, ReactionSet) from infer_gpu()
+
+        Returns:
+            Tuple of (crops, indices) where:
+            - crops: List of numpy image arrays
+            - indices: List of (list_idx, rxn_idx, bbox_idx) tuples for applying results back
+        """
+        crops = []
+        indices = []
+        for list_idx, (img_idx, pred_reactions) in enumerate(all_reaction_sets):
+            for rxn_idx, reaction in enumerate(pred_reactions):
+                for bbox_idx, bbox in enumerate(reaction.bboxes):
+                    if bbox.is_mol:
+                        crops.append(bbox.image())
+                        indices.append((list_idx, rxn_idx, bbox_idx))
+        return crops, indices
+
+    @staticmethod
+    def collect_ocr_tasks(all_reaction_sets):
+        """
+        CPU: collect all non-molecule bboxes that need OCR.
+
+        Returns:
+            List of BBox objects that need OCR text.
+        """
+        tasks = []
+        for _, pred_reactions in all_reaction_sets:
+            for reaction in pred_reactions:
+                for bbox in reaction.bboxes:
+                    if not bbox.is_mol:
+                        tasks.append(bbox)
+        return tasks
+
+    @staticmethod
+    def apply_smiles(all_reaction_sets, indices, predictions):
+        """
+        CPU: apply MolScribe prediction results back to reaction bboxes.
+
+        Args:
+            all_reaction_sets: List of (img_idx, ReactionSet)
+            indices: List of (list_idx, rxn_idx, bbox_idx) from collect_mol_crops()
+            predictions: List of prediction dicts from MolScribe
+        """
+        for (list_idx, rxn_idx, bbox_idx), pred in zip(indices, predictions):
+            _, pred_reactions = all_reaction_sets[list_idx]
+            pred_reactions[rxn_idx].bboxes[bbox_idx].set_smiles(
+                pred['smiles'], pred.get('molfile'), pred.get('atoms'), pred.get('bonds')
+            )
+
+    @staticmethod
+    def apply_ocr(ocr_tasks, ocr_results):
+        """CPU: apply OCR results back to bboxes."""
+        for bbox, text in zip(ocr_tasks, ocr_results):
+            bbox.set_text(text)
+
+    @staticmethod
+    def finalize(all_reaction_sets):
+        """CPU: convert ReactionSets to JSON output format."""
+        return [pred_reactions.to_json() for _, pred_reactions in all_reaction_sets]
+
     def predict_image(self, image, **kwargs):
         predictions = self.predict_images([image], **kwargs)
         return predictions[0]
@@ -476,6 +580,172 @@ class MolDetect:
     def get_last_timing(self):
         """Get timing data from the last predict_images call."""
         return getattr(self, '_last_timing', None)
+
+    def infer_gpu(self, input_images: List, batch_size=16):
+        """
+        GPU-only inference for bbox (molecule detection) mode.
+        Returns raw bbox data without MolScribe processing.
+
+        Returns:
+            List of (img_idx, raw_bboxes_dict) where raw_bboxes_dict has 'bboxes' key
+        """
+        device = self.device
+        tokenizer = self.tokenizer['bbox']
+        all_raw_bboxes = []
+
+        for idx in range(0, len(input_images), batch_size):
+            batch_images = input_images[idx:idx+batch_size]
+
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                transformed = list(pool.map(self.transform, batch_images))
+            images, refs = zip(*transformed)
+            images = torch.stack(images, dim=0)
+            if device.type == 'cuda':
+                images = images.pin_memory().to(device, non_blocking=True)
+            else:
+                images = images.to(device)
+
+            with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16, enabled=(device.type == 'cuda')):
+                pred_seqs, pred_scores = self.model(images, max_len=tokenizer.max_len)
+
+            for i, (seqs, scores) in enumerate(zip(pred_seqs, pred_scores)):
+                bboxes = tokenizer.sequence_to_data(seqs.tolist(), scores.tolist(), scale=refs[i]['scale'])
+                all_raw_bboxes.append((idx + i, bboxes))
+
+        return all_raw_bboxes
+
+    def infer_gpu_coref(self, input_images: List, batch_size=16):
+        """
+        GPU-only inference for coref mode.
+        Returns raw coref bbox data without MolScribe or OCR processing.
+
+        Returns:
+            List of (img_idx, raw_bboxes_dict) where raw_bboxes_dict has 'bboxes' and 'corefs' keys
+        """
+        device = self.device
+        tokenizer = self.tokenizer['coref']
+        all_raw_bboxes = []
+
+        for idx in range(0, len(input_images), batch_size):
+            batch_images = input_images[idx:idx+batch_size]
+
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                transformed = list(pool.map(self.transform, batch_images))
+            images, refs = zip(*transformed)
+            images = torch.stack(images, dim=0)
+            if device.type == 'cuda':
+                images = images.pin_memory().to(device, non_blocking=True)
+            else:
+                images = images.to(device)
+
+            with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16, enabled=(device.type == 'cuda')):
+                pred_seqs, pred_scores = self.model(images, max_len=tokenizer.max_len)
+
+            for i, (seqs, scores) in enumerate(zip(pred_seqs, pred_scores)):
+                bboxes = tokenizer.sequence_to_data(seqs.tolist(), scores.tolist(), scale=refs[i]['scale'])
+                all_raw_bboxes.append((idx + i, bboxes))
+
+        return all_raw_bboxes
+
+    def postprocess_mol_bboxes_deferred(self, input_images, all_raw_bboxes):
+        """
+        CPU: Create BBox objects from raw bboxes (molecule detection mode).
+        Returns data structures needed for crop collection.
+
+        Returns:
+            List of (img_idx, deduplicated_bbox_objects, image_cv2)
+        """
+        from .data import ImageData, BBox, deduplicate_bboxes
+        results = []
+        for img_idx, raw_bboxes in all_raw_bboxes:
+            image = input_images[img_idx]
+            image_d = ImageData(image=image)
+            bbox_objects = [BBox(bbox=bbox, image_data=image_d, xyxy=True, normalized=True)
+                          for bbox in raw_bboxes]
+            bbox_objects = [b for b in bbox_objects if not b.is_empty]
+            deduplicated = deduplicate_bboxes(bbox_objects)
+            results.append((img_idx, deduplicated, image))
+        return results
+
+    def postprocess_coref_bboxes_deferred(self, input_images, all_raw_bboxes):
+        """
+        CPU: Create BBox objects from raw coref bboxes.
+        Resizes images 3x as required by coref postprocessing.
+
+        Returns:
+            List of (img_idx, bbox_objects, corefs)
+        """
+        import cv2
+        from .data import ImageData, BBox
+        results = []
+        for img_idx, raw_bboxes in all_raw_bboxes:
+            image = input_images[img_idx]
+            image_d = ImageData(image=cv2.resize(np.asarray(image), None, fx=3, fy=3))
+            bbox_objects = [BBox(bbox=bbox, image_data=image_d, xyxy=True, normalized=True)
+                          for bbox in raw_bboxes['bboxes']]
+            corefs = raw_bboxes['corefs']
+            results.append((img_idx, bbox_objects, corefs))
+        return results
+
+    @staticmethod
+    def collect_mol_crops_from_bboxes(processed_bboxes, is_coref=False):
+        """
+        CPU: collect all molecule image crops from processed bbox data.
+
+        Args:
+            processed_bboxes: Output from postprocess_mol_bboxes_deferred or postprocess_coref_bboxes_deferred
+            is_coref: True if processing coref results
+
+        Returns:
+            Tuple of (crops, indices) where:
+            - crops: list of numpy image arrays
+            - indices: list of (list_idx, bbox_idx) tuples
+        """
+        crops = []
+        indices = []
+        for list_idx, item in enumerate(processed_bboxes):
+            if is_coref:
+                _, bbox_objects, _ = item
+            else:
+                _, bbox_objects, _ = item
+            for bbox_idx, bbox in enumerate(bbox_objects):
+                if bbox.is_mol:
+                    crops.append(bbox.image())
+                    indices.append((list_idx, bbox_idx))
+        return crops, indices
+
+    @staticmethod
+    def collect_ocr_tasks_from_coref(processed_coref):
+        """CPU: collect all identifier bboxes that need OCR from coref data."""
+        tasks = []
+        for _, bbox_objects, _ in processed_coref:
+            for bbox in bbox_objects:
+                if bbox.is_idt:
+                    tasks.append(bbox)
+        return tasks
+
+    @staticmethod
+    def apply_smiles_to_bboxes(processed_bboxes, indices, predictions):
+        """CPU: apply MolScribe results back to bbox objects."""
+        for (list_idx, bbox_idx), pred in zip(indices, predictions):
+            item = processed_bboxes[list_idx]
+            bbox_objects = item[1]
+            bbox_objects[bbox_idx].set_smiles(
+                pred['smiles'], pred.get('molfile'), pred.get('atoms'), pred.get('bonds')
+            )
+
+    @staticmethod
+    def finalize_mol_bboxes(processed_bboxes):
+        """CPU: convert molecule bbox results to JSON."""
+        return [[bbox.to_json() for bbox in item[1]] for item in processed_bboxes]
+
+    @staticmethod
+    def finalize_coref_bboxes(processed_coref):
+        """CPU: convert coref bbox results to JSON."""
+        return [{
+            'bboxes': [b.to_json() for b in bbox_objects],
+            'corefs': corefs
+        } for _, bbox_objects, corefs in processed_coref]
 
     def _postprocess_coref_batched(self, input_images, all_raw_bboxes, molscribe, ocr, batch_size, skip_molblock):
         """
