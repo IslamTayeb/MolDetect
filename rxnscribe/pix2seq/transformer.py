@@ -8,6 +8,7 @@ Copy-paste from torch.nn.Transformer with modifications:
     * decoder returns a stack of activations from all decoding layers
 """
 import copy
+import time
 from typing import Optional, List
 
 import torch
@@ -67,7 +68,13 @@ class Transformer(nn.Module):
         mask = mask.flatten(1)
         pos_embed = pos_embed.flatten(2).permute(2, 0, 1)
 
+        if src.is_cuda:
+            torch.cuda.synchronize()
+        t_enc = time.perf_counter()
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
+        if memory.is_cuda:
+            torch.cuda.synchronize()
+        self._last_encoder_time = time.perf_counter() - t_enc
         pre_kv = [torch.as_tensor([[], []], device=memory.device)
                   for _ in range(self.num_decoder_layers)]
 
@@ -90,6 +97,7 @@ class Transformer(nn.Module):
             pred_seq_logits = self.vocal_classifier(hs.transpose(0, 1))
             return pred_seq_logits
         else:
+            t_dec = time.perf_counter()
             end = torch.zeros(bs).bool().to(memory.device)
             end_lens = torch.zeros(bs).long().to(memory.device)
             input_embed = self.det_embed.weight.unsqueeze(0).repeat(bs, 1, 1).transpose(0, 1)
@@ -133,6 +141,9 @@ class Transformer(nn.Module):
             pred_seq = [seq[:end_idx] for end_idx, seq in zip(end_lens, pred_seq)]
             pred_scores = torch.cat(pred_scores, dim=1)
             pred_scores = [scores[:end_idx] for end_idx, scores in zip(end_lens, pred_scores)]
+            if memory.is_cuda:
+                torch.cuda.synchronize()
+            self._last_decoder_time = time.perf_counter() - t_dec
             return pred_seq, pred_scores
 
 

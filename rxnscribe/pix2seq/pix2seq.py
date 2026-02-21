@@ -2,6 +2,7 @@
 """
 Pix2Seq model and criterion classes.
 """
+import time
 import torch
 from torch.profiler import profile, record_function, ProfilerActivity
 import torch.nn.functional as F
@@ -50,7 +51,10 @@ class Pix2Seq(nn.Module):
 
         if isinstance(image_tensor, (list, torch.Tensor)):
             image_tensor = nested_tensor_from_tensor_list(image_tensor)
-        features, pos = self.backbone(image_tensor)  
+        if image_tensor.tensors.is_cuda:
+            torch.cuda.synchronize()
+        t_backbone = time.perf_counter()
+        features, pos = self.backbone(image_tensor)
         #print(len(features))
         #print(pos.size()) 
         '''
@@ -65,9 +69,9 @@ class Pix2Seq(nn.Module):
         mask = torch.zeros_like(mask).bool()
 
         src = self.input_proj(src)
-
-        
-        
+        if src.is_cuda:
+            torch.cuda.synchronize()
+        self._last_backbone_time = time.perf_counter() - t_backbone
 
         if self.use_hf: 
             if targets is not None:

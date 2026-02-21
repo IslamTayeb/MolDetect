@@ -1,4 +1,5 @@
 import os
+import time
 import argparse
 from typing import List
 from concurrent.futures import ThreadPoolExecutor
@@ -102,7 +103,11 @@ class RxnScribe:
         timing_data = {
             'modules': [],
             'transform_time': 0,
+            'sync_wait': 0,
             'model_inference_time': 0,
+            'backbone_time': 0,
+            'encoder_time': 0,
+            'decoder_time': 0,
             'postprocess_time': 0,
             'molscribe_time': 0,
             'ocr_time': 0,
@@ -126,11 +131,21 @@ class RxnScribe:
             images = torch.stack(images, dim=0).to(device)
             timing_data['transform_time'] += time.time() - t0
 
-            # Model inference timing — FP16 autocast
+            # Sync wait — measure cost of waiting for async transfer
+            t0 = time.time()
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            timing_data['sync_wait'] += time.time() - t0
+
             t0 = time.time()
             with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16, enabled=(device.type == 'cuda')):
                 pred_seqs, pred_scores = self.model(images, max_len=tokenizer.max_len)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
             timing_data['model_inference_time'] += time.time() - t0
+            timing_data['backbone_time'] += getattr(self.model, '_last_backbone_time', 0)
+            timing_data['encoder_time'] += getattr(self.model.transformer, '_last_encoder_time', 0)
+            timing_data['decoder_time'] += getattr(self.model.transformer, '_last_decoder_time', 0)
 
             for i, (seqs, scores) in enumerate(zip(pred_seqs, pred_scores)):
                 reactions = tokenizer.sequence_to_data(seqs.tolist(), scores.tolist(), scale=refs[i]['scale'])
@@ -260,11 +275,15 @@ class RxnScribe:
         device = self.device
         tokenizer = self.tokenizer['reaction']
         all_reaction_sets = []
+        t_total = time.time()
+        timing = {'backbone': 0, 'encoder': 0, 'decoder': 0, 'transform': 0,
+                  'postprocess': 0, 'model_total': 0, 'sync_wait': 0}
 
         for idx in range(0, len(input_images), batch_size):
 
             batch_images = input_images[idx:idx+batch_size]
 
+            t0 = time.time()
             with ThreadPoolExecutor(max_workers=4) as pool:
                 transformed = list(pool.map(self.transform, batch_images))
             images, refs = zip(*transformed)
@@ -273,15 +292,34 @@ class RxnScribe:
                 images = images.pin_memory().to(device, non_blocking=True)
             else:
                 images = images.to(device)
+            timing['transform'] += time.time() - t0
 
+            t_sync = time.time()
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            timing['sync_wait'] += time.time() - t_sync
+
+            t_model = time.time()
             with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16, enabled=(device.type == 'cuda')):
                 pred_seqs, pred_scores = self.model(images, max_len=tokenizer.max_len)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            timing['model_total'] += time.time() - t_model
 
+            # Collect encoder/decoder timing from model internals (already synced inside)
+            timing['backbone'] += getattr(self.model, '_last_backbone_time', 0)
+            timing['encoder'] += getattr(self.model.transformer, '_last_encoder_time', 0)
+            timing['decoder'] += getattr(self.model.transformer, '_last_decoder_time', 0)
+
+            t0 = time.time()
             for i, (seqs, scores) in enumerate(zip(pred_seqs, pred_scores)):
                 reactions = tokenizer.sequence_to_data(seqs.tolist(), scores.tolist(), scale=refs[i]['scale'])
                 pred_reactions = postprocess_reactions_deferred(reactions, image=input_images[idx + i])
                 all_reaction_sets.append((idx + i, pred_reactions))
+            timing['postprocess'] += time.time() - t0
 
+        timing['total'] = time.time() - t_total
+        self._last_timing = timing
         return all_reaction_sets
 
     @staticmethod
@@ -489,7 +527,9 @@ class MolDetect:
         timing_data = {
             'modules': [],
             'transform_time': 0,
+            'sync_wait': 0,
             'model_inference_time': 0,
+            'backbone_time': 0,
             'postprocess_time': 0,
             'molscribe_time': 0,
             'ocr_time': 0,
@@ -515,11 +555,19 @@ class MolDetect:
             images = torch.stack(images, dim=0).to(device)
             timing_data['transform_time'] += time.time() - t0
 
-            # Model inference timing — FP16 autocast
+            # Sync wait — measure cost of waiting for async transfer
+            t0 = time.time()
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            timing_data['sync_wait'] += time.time() - t0
+
             t0 = time.time()
             with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16, enabled=(device.type == 'cuda')):
                 pred_seqs, pred_scores = self.model(images, max_len=tokenizer.max_len)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
             timing_data['model_inference_time'] += time.time() - t0
+            timing_data['backbone_time'] += getattr(self.model, '_last_backbone_time', 0)
 
             for i, (seqs, scores) in enumerate(zip(pred_seqs, pred_scores)):
                 bboxes = tokenizer.sequence_to_data(seqs.tolist(), scores.tolist(), scale=refs[i]['scale'])
@@ -592,10 +640,14 @@ class MolDetect:
         device = self.device
         tokenizer = self.tokenizer['bbox']
         all_raw_bboxes = []
+        t_total = time.time()
+        timing = {'backbone': 0, 'generate': 0, 'transform': 0, 'postprocess': 0,
+                  'model_total': 0, 'sync_wait': 0}
 
         for idx in range(0, len(input_images), batch_size):
             batch_images = input_images[idx:idx+batch_size]
 
+            t0 = time.time()
             with ThreadPoolExecutor(max_workers=4) as pool:
                 transformed = list(pool.map(self.transform, batch_images))
             images, refs = zip(*transformed)
@@ -604,14 +656,34 @@ class MolDetect:
                 images = images.pin_memory().to(device, non_blocking=True)
             else:
                 images = images.to(device)
+            timing['transform'] += time.time() - t0
 
+            t_sync = time.time()
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            timing['sync_wait'] += time.time() - t_sync
+
+            t_model = time.time()
             with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16, enabled=(device.type == 'cuda')):
                 pred_seqs, pred_scores = self.model(images, max_len=tokenizer.max_len)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            model_elapsed = time.time() - t_model
+            timing['model_total'] += model_elapsed
 
+            # backbone time from Pix2Seq (already synced inside); rest is HF generate()
+            backbone_t = getattr(self.model, '_last_backbone_time', 0)
+            timing['backbone'] += backbone_t
+            timing['generate'] += model_elapsed - backbone_t
+
+            t0 = time.time()
             for i, (seqs, scores) in enumerate(zip(pred_seqs, pred_scores)):
                 bboxes = tokenizer.sequence_to_data(seqs.tolist(), scores.tolist(), scale=refs[i]['scale'])
                 all_raw_bboxes.append((idx + i, bboxes))
+            timing['postprocess'] += time.time() - t0
 
+        timing['total'] = time.time() - t_total
+        self._last_timing = timing
         return all_raw_bboxes
 
     def infer_gpu_coref(self, input_images: List, batch_size=16):
@@ -625,10 +697,14 @@ class MolDetect:
         device = self.device
         tokenizer = self.tokenizer['coref']
         all_raw_bboxes = []
+        t_total = time.time()
+        timing = {'backbone': 0, 'generate': 0, 'transform': 0, 'postprocess': 0,
+                  'model_total': 0, 'sync_wait': 0}
 
         for idx in range(0, len(input_images), batch_size):
             batch_images = input_images[idx:idx+batch_size]
 
+            t0 = time.time()
             with ThreadPoolExecutor(max_workers=4) as pool:
                 transformed = list(pool.map(self.transform, batch_images))
             images, refs = zip(*transformed)
@@ -637,14 +713,34 @@ class MolDetect:
                 images = images.pin_memory().to(device, non_blocking=True)
             else:
                 images = images.to(device)
+            timing['transform'] += time.time() - t0
 
+            t_sync = time.time()
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            timing['sync_wait'] += time.time() - t_sync
+
+            t_model = time.time()
             with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16, enabled=(device.type == 'cuda')):
                 pred_seqs, pred_scores = self.model(images, max_len=tokenizer.max_len)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            model_elapsed = time.time() - t_model
+            timing['model_total'] += model_elapsed
 
+            # backbone time from Pix2Seq (already synced inside); rest is HF generate()
+            backbone_t = getattr(self.model, '_last_backbone_time', 0)
+            timing['backbone'] += backbone_t
+            timing['generate'] += model_elapsed - backbone_t
+
+            t0 = time.time()
             for i, (seqs, scores) in enumerate(zip(pred_seqs, pred_scores)):
                 bboxes = tokenizer.sequence_to_data(seqs.tolist(), scores.tolist(), scale=refs[i]['scale'])
                 all_raw_bboxes.append((idx + i, bboxes))
+            timing['postprocess'] += time.time() - t0
 
+        timing['total'] = time.time() - t_total
+        self._last_coref_timing = timing
         return all_raw_bboxes
 
     def postprocess_mol_bboxes_deferred(self, input_images, all_raw_bboxes):
