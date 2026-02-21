@@ -1,5 +1,8 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+_HAS_SDPA = hasattr(F, 'scaled_dot_product_attention')
 
 
 class Attention(nn.Module):
@@ -10,27 +13,32 @@ class Attention(nn.Module):
         self.scale = head_dim ** -0.5
 
         self.qkv = nn.Linear(dim, dim * 3)
-        self.attn_drop = nn.Dropout(dropout)
+        self.attn_drop_p = dropout
+        if not _HAS_SDPA:
+            self.attn_drop = nn.Dropout(dropout)
         self.proj = nn.Linear(dim, dim)
 
     def forward(self, x, pre_kv=None, attn_mask=None):
         N, B, C = x.shape
         qkv = self.qkv(x).reshape(N, B, 3, self.num_heads, C // self.num_heads).permute(2, 1, 3, 0, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
         if not self.training:
             k = torch.cat([pre_kv[0], k], dim=2)
             v = torch.cat([pre_kv[1], v], dim=2)
             pre_kv = torch.stack([k, v], dim=0)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
+        if _HAS_SDPA:
+            drop_p = self.attn_drop_p if self.training else 0.0
+            x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=drop_p)
+        else:
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            if attn_mask is not None:
+                attn.masked_fill_(attn_mask, float('-inf'))
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x = attn @ v
 
-        if attn_mask is not None:
-            attn.masked_fill_(attn_mask, float('-inf'))
-
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).permute(2, 0, 1, 3).reshape(N, B, C)
+        x = x.permute(2, 0, 1, 3).reshape(N, B, C)
         x = self.proj(x)
         return x, pre_kv
