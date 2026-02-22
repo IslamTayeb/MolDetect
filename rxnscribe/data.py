@@ -99,7 +99,7 @@ class BBox(object):
         ax.add_patch(rect)
         return
 
-    def set_smiles(self, smiles, molfile=None, atoms=None, bonds=None):
+    def set_smiles(self, smiles, molfile=None, atoms=None, bonds=None, confidence=None):
         self.data['smiles'] = smiles
         if molfile:
             self.data['molfile'] = molfile
@@ -107,6 +107,8 @@ class BBox(object):
             self.data['atoms'] = atoms
         if bonds:
             self.data['bonds'] = bonds
+        if confidence is not None:
+            self.data['confidence'] = confidence
 
     def set_text(self, text):
         self.data['text'] = text
@@ -538,18 +540,18 @@ def postprocess_reactions(reactions, image_file=None, image=None, molscribe=None
         if len(bbox_images) > 0:
             # MolScribe prediction (batched)
             t0 = time.time()
-            predictions = molscribe.predict_images(bbox_images, return_atoms_bonds=True, batch_size=batch_size, skip_molblock=skip_molblock)
+            predictions = molscribe.predict_images(bbox_images, return_atoms_bonds=True, return_confidence=True, batch_size=batch_size, skip_molblock=skip_molblock)
             record_timing('postprocess_reactions.molscribe.predict_images', time.time() - t0)
 
             for (i, j, bbox_coords), pred in zip(bbox_indices, predictions):
-                pred_reactions[i].bboxes[j].set_smiles(pred['smiles'], pred['molfile'], pred['atoms'], pred['bonds'])
+                pred_reactions[i].bboxes[j].set_smiles(pred['smiles'], pred['molfile'], pred['atoms'], pred['bonds'], confidence=pred.get('confidence'))
                 # Store in cache
                 if has_cache and figure_id is not None:
                     molscribe.cache_smiles(figure_id, bbox_coords, pred)
 
         # Apply cache hits
         for i, j, pred in cache_hits:
-            pred_reactions[i].bboxes[j].set_smiles(pred['smiles'], pred.get('molfile'), pred.get('atoms'), pred.get('bonds'))
+            pred_reactions[i].bboxes[j].set_smiles(pred['smiles'], pred.get('molfile'), pred.get('atoms'), pred.get('bonds'), confidence=pred.get('confidence'))
 
     if ocr:
         # OCR for condition text — parallel with ThreadPoolExecutor
@@ -611,17 +613,17 @@ def postprocess_bboxes(bboxes, image = None, molscribe = None, batch_size = 32, 
 
         # Process cache misses with MolScribe
         if len(bbox_images) > 0:
-            predictions = molscribe.predict_images(bbox_images, return_atoms_bonds=True, batch_size = batch_size, skip_molblock=skip_molblock)
+            predictions = molscribe.predict_images(bbox_images, return_atoms_bonds=True, return_confidence=True, batch_size = batch_size, skip_molblock=skip_molblock)
 
             for (i, bbox_coords), pred in zip(bbox_indices, predictions):
-                deduplicated[i].set_smiles(pred['smiles'], pred['molfile'], pred['atoms'], pred['bonds'])
+                deduplicated[i].set_smiles(pred['smiles'], pred['molfile'], pred['atoms'], pred['bonds'], confidence=pred.get('confidence'))
                 # Store in cache
                 if has_cache and figure_id is not None:
                     molscribe.cache_smiles(figure_id, bbox_coords, pred)
 
         # Apply cache hits
         for i, pred in cache_hits:
-            deduplicated[i].set_smiles(pred['smiles'], pred.get('molfile'), pred.get('atoms'), pred.get('bonds'))
+            deduplicated[i].set_smiles(pred['smiles'], pred.get('molfile'), pred.get('atoms'), pred.get('bonds'), confidence=pred.get('confidence'))
 
     return [bbox.to_json() for bbox in deduplicated]
 
@@ -648,11 +650,11 @@ def postprocess_coref_results(bboxes, image, molscribe = None, ocr = None, batch
         if len(bbox_images) > 0:
             # MolScribe prediction (batched)
             t0 = time.time()
-            predictions = molscribe.predict_images(bbox_images, return_atoms_bonds=True, batch_size = batch_size, skip_molblock=skip_molblock)
+            predictions = molscribe.predict_images(bbox_images, return_atoms_bonds=True, return_confidence=True, batch_size = batch_size, skip_molblock=skip_molblock)
             record_timing('postprocess_coref.molscribe.predict_images', time.time() - t0)
 
             for i, pred in zip(bbox_indices, predictions):
-                bbox_objects[i].set_smiles(pred['smiles'], pred['molfile'], pred['atoms'], pred['bonds'])
+                bbox_objects[i].set_smiles(pred['smiles'], pred['molfile'], pred['atoms'], pred['bonds'], confidence=pred.get('confidence'))
 
     if ocr:
         # OCR for identifier text (sequential - known bottleneck)

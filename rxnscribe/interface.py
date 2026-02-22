@@ -189,6 +189,7 @@ class RxnScribe:
                 t0 = time.time()
                 predictions = self.molscribe.predict_images(
                     all_mol_images, return_atoms_bonds=True,
+                    return_confidence=True,
                     batch_size=batch_size, skip_molblock=skip_molblock
                 )
                 molscribe_time = time.time() - t0
@@ -203,7 +204,8 @@ class RxnScribe:
                 for (list_idx, rxn_idx, bbox_idx, figure_id, bbox_coords), pred in zip(mol_indices, predictions):
                     _, pred_reactions = all_reaction_sets[list_idx]
                     pred_reactions[rxn_idx].bboxes[bbox_idx].set_smiles(
-                        pred['smiles'], pred['molfile'], pred['atoms'], pred['bonds']
+                        pred['smiles'], pred['molfile'], pred['atoms'], pred['bonds'],
+                        confidence=pred.get('confidence')
                     )
                     if has_cache and figure_id is not None:
                         self.molscribe.cache_smiles(figure_id, bbox_coords, pred)
@@ -213,7 +215,8 @@ class RxnScribe:
                 for list_idx, rxn_idx, bbox_idx, pred in cache_hits:
                     _, pred_reactions = all_reaction_sets[list_idx]
                     pred_reactions[rxn_idx].bboxes[bbox_idx].set_smiles(
-                        pred['smiles'], pred.get('molfile'), pred.get('atoms'), pred.get('bonds')
+                        pred['smiles'], pred.get('molfile'), pred.get('atoms'), pred.get('bonds'),
+                        confidence=pred.get('confidence')
                     )
 
         # Phase 3: Collect ALL OCR bboxes across ALL images → ONE threaded OCR batch
@@ -910,6 +913,7 @@ class MolDetect:
                 predictions = molscribe.predict_images(
                     all_mol_images,
                     return_atoms_bonds=True,
+                    return_confidence=True,
                     batch_size=batch_size,
                     skip_molblock=skip_molblock
                 )
@@ -925,7 +929,8 @@ class MolDetect:
                 t0 = time.time()
                 for (list_idx, bbox_idx, img_idx, bbox_coords), pred in zip(mol_indices, predictions):
                     all_image_data[list_idx][1][bbox_idx].set_smiles(
-                        pred['smiles'], pred['molfile'], pred['atoms'], pred['bonds']
+                        pred['smiles'], pred['molfile'], pred['atoms'], pred['bonds'],
+                        confidence=pred.get('confidence')
                     )
                     # Store in cache
                     if has_cache:
@@ -937,7 +942,8 @@ class MolDetect:
                 t0 = time.time()
                 for list_idx, bbox_idx, pred in cache_hits:
                     all_image_data[list_idx][1][bbox_idx].set_smiles(
-                        pred['smiles'], pred.get('molfile'), pred.get('atoms'), pred.get('bonds')
+                        pred['smiles'], pred.get('molfile'), pred.get('atoms'), pred.get('bonds'),
+                        confidence=pred.get('confidence')
                     )
                 timing_data['modules'].append({'name': 'coref_batched.apply_cache_hits', 'time': time.time() - t0})
 
