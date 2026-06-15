@@ -36,7 +36,6 @@ class Pix2Seq(nn.Module):
 
         self.use_hf = use_hf
 
-        
 
     def forward(self, image_tensor, targets=None, max_len=500, cheat = None):
         """ 
@@ -54,21 +53,13 @@ class Pix2Seq(nn.Module):
         if image_tensor.tensors.is_cuda:
             torch.cuda.synchronize()
         t_backbone = time.perf_counter()
-        features, pos = self.backbone(image_tensor)
-        #print(len(features))
-        #print(pos.size()) 
-        '''
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack = True, record_shapes=True) as prof:
-                with record_function("model_inference"):
-                    features, pos = self.backbone(image_tensor)
-        print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
-        prof.export_stacks("/tmp/profiler_stacks_cuda_A6000_16_backbone.txt", "self_cuda_time_total") 
-        '''
-        src, mask = features[-1].decompose()
-        assert mask is not None
-        mask = torch.zeros_like(mask).bool()
 
+        features, pos = self.backbone(image_tensor)
+        src, mask = features[-1].decompose()
+        mask = torch.zeros_like(mask).bool()
         src = self.input_proj(src)
+        pos_embed = pos[-1]
+
         if src.is_cuda:
             torch.cuda.synchronize()
         self._last_backbone_time = time.perf_counter() - t_backbone
@@ -181,10 +172,10 @@ class Pix2Seq(nn.Module):
         else:
             if targets is not None:
                 input_seq, input_len = targets
-                output_logits = self.transformer(src, input_seq[:, 1:], mask, pos[-1])
+                output_logits = self.transformer(src, input_seq[:, 1:], mask, pos_embed)
                 return output_logits[:, :-1]
             else:
-                output_seqs, output_scores = self.transformer(src, None, mask, pos[-1], max_len=max_len)
+                output_seqs, output_scores = self.transformer(src, None, mask, pos_embed, max_len=max_len)
                 return output_seqs, output_scores
 
 
